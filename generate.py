@@ -8,6 +8,9 @@
 
 """Generate images using pretrained network pickle."""
 
+import hfai_env
+hfai_env.set_env('ada-cuda-11.1') 
+
 import os
 import re
 from typing import List, Optional

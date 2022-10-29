@@ -24,6 +24,11 @@ from torch_utils.ops import grid_sample_gradfix
 import legacy
 from metrics import metric_main
 
+import hfai
+import hfai.nccl.distributed as dist
+from hfai.nn.parallel import DistributedDataParallel
+from pathlib import Path
+
 #----------------------------------------------------------------------------
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
@@ -159,6 +164,40 @@ def training_loop(
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
+
+    # Resume from suspend.
+    cur_nimg = 0
+    cur_tick = 0
+    tick_start_nimg = cur_nimg
+    batch_idx = 0
+
+    run_dir_path = Path(run_dir)
+    if (run_dir_path / 'network-snapshot-latest-suspend.pkl').exists():
+        snapshot_pkl = os.path.join(run_dir, f'network-snapshot-latest-suspend.pkl')
+        if (resume_pkl is not None) and (rank == 0):
+            print(f'Resuming from "{resume_pkl}"')
+            with dnnlib.util.open_url(resume_pkl) as f:
+                resume_data = legacy.load_network_pkl(f)
+            for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
+                misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+
+            cur_nimg = resume_data['suspend_state']['cur_nimg']
+            cur_tick = resume_data['suspend_state']['cur_tick']
+            tick_start_nimg = resume_data['suspend_state']['tick_start_nimg']
+            batch_idx = resume_data['suspend_state']['batch_idx']
+            if progress_fn is not None:
+                progress_fn(cur_nimg // 1000 , total_kimg)
+    else:
+        if progress_fn is not None:
+            progress_fn(0, total_kimg)
+
+        # TO DO
+        # 'optimizer': optimizer.state_dict(),
+        # 'scheduler': scheduler.state_dict(),
+        # 'acc': best_acc,
+        # 'epoch': epoch,
+        # 'step': step + 1
+
     # Print network summary tables.
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
@@ -245,14 +284,10 @@ def training_loop(
     if rank == 0:
         print(f'Training for {total_kimg} kimg...')
         print()
-    cur_nimg = 0
-    cur_tick = 0
-    tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
-    batch_idx = 0
-    if progress_fn is not None:
-        progress_fn(0, total_kimg)
+
+
     while True:
 
         # Fetch training data.
@@ -313,6 +348,31 @@ def training_loop(
             ada_stats.update()
             adjust = np.sign(ada_stats['Loss/signs/real'] - ada_target) * (batch_size * ada_interval) / (ada_kimg * 1000)
             augment_pipe.p.copy_((augment_pipe.p + adjust).max(misc.constant(0, device=device)))
+
+        # 中断保存
+        if dist.get_rank() == 0 and rank == 0 and hfai.client.receive_suspend_command():
+            snapshot_pkl = None
+            snapshot_data = dict(training_set_kwargs=dict(training_set_kwargs))
+            snapshot_data['suspend_state'] = {
+                'cur_nimg': cur_nimg,
+                'cur_tick': cur_tick,                # not best way to save 
+                'tick_start_nimg': tick_start_nimg,  # not best way to save 
+                'batch_idx': batch_idx,
+            }
+            for name, module in [('G', G), ('D', D), ('G_ema', G_ema), ('augment_pipe', augment_pipe)]:
+                if module is not None:
+                    if num_gpus > 1:
+                        misc.check_ddp_consistency(module, ignore_regex=r'.*\.w_avg')
+                    module = copy.deepcopy(module).eval().requires_grad_(False).cpu()
+                snapshot_data[name] = module
+                del module # conserve memory
+            snapshot_pkl = os.path.join(run_dir, f'network-snapshot-latest-suspend.pkl')
+            if rank == 0:
+                with open(snapshot_pkl, 'wb') as f:
+                    pickle.dump(snapshot_data, f)
+
+            time.sleep(3)
+            hfai.client.go_suspend()
 
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)

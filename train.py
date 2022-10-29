@@ -10,6 +10,17 @@
 "Training Generative Adversarial Networks with Limited Data"."""
 
 import os
+import shutil
+# if os.path.exists('~/.cache/torch_extensions'):
+#     shutil.rmtree('~/.cache/torch_extensions')
+# if os.path.exists('/home/suyee/daochang/.cache/torch_extensions'):
+#     shutil.rmtree('/home/suyee/daochang/.cache/torch_extensions')
+# if os.path.exists('/home/suyee/.cache/torch_extensions'):
+#     shutil.rmtree('/home/suyee/.cache/torch_extensions')
+
+import hfai_env
+hfai_env.set_env('ada-cuda-11.1') 
+
 import click
 import re
 import json
@@ -17,10 +28,20 @@ import tempfile
 import torch
 import dnnlib
 
+# import subprocess
+# for i in range(30):
+#     print('torch', torch.version.cuda)
+#     result = subprocess.run(['nvcc', '--version'], stdout=subprocess.PIPE).stdout.decode('utf-8')
+#     print('nvcc', result)
+
 from training import training_loop
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
+
+import hfai
+import hfai.nccl.distributed as dist
+from hfai.nn.parallel import DistributedDataParallel
 
 #----------------------------------------------------------------------------
 
@@ -157,7 +178,8 @@ def setup_training_loop_kwargs(
         'paper256':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=0.5, lrate=0.0025, gamma=1,    ema=20,  ramp=None, map=8),
         'paper512':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=1,   lrate=0.0025, gamma=0.5,  ema=20,  ramp=None, map=8),
         'paper1024': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=2,    ema=10,  ramp=None, map=8),
-        'cifar':     dict(ref_gpus=2,  kimg=100000, mb=64, mbstd=32, fmaps=1,   lrate=0.0025, gamma=0.01, ema=500, ramp=0.05, map=2),
+        # 'cifar':     dict(ref_gpus=2,  kimg=100000, mb=64, mbstd=32, fmaps=1,   lrate=0.0025, gamma=0.01, ema=500, ramp=0.05, map=2),
+        'cifar':     dict(ref_gpus=8,  kimg=100000, mb=64, mbstd=32, fmaps=1,   lrate=0.0025, gamma=0.01, ema=500, ramp=0.05, map=2),
     }
 
     assert cfg in cfg_specs
@@ -363,15 +385,28 @@ def setup_training_loop_kwargs(
 def subprocess_fn(rank, args, temp_dir):
     dnnlib.util.Logger(file_name=os.path.join(args.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
+    # # Multi-machine communication
+    ip = os.environ['MASTER_IP']
+    port = os.environ['MASTER_PORT']
+    host_nums = int(os.environ['WORLD_SIZE'])  # 机器个数 number of machines note
+    node_rank = int(os.environ['RANK'])  # 当前机器编号 the rank of current note
+    node_gpus = torch.cuda.device_count()  # 每台机器的GPU个数 the number of GPU on each GPU
+
+    rank = node_rank * node_gpus + rank
+
     # Init torch.distributed.
     if args.num_gpus > 1:
         init_file = os.path.abspath(os.path.join(temp_dir, '.torch_distributed_init'))
         if os.name == 'nt':
-            init_method = 'file:///' + init_file.replace('\\', '/')
+            # init_method = 'file:///' + init_file.replace('\\', '/')
+            init_method=f'tcp://{ip}:{port}'
             torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=args.num_gpus)
+            # torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=host_nums * node_gpus)
         else:
-            init_method = f'file://{init_file}'
+            # init_method = f'file://{init_file}'
+            init_method=f'tcp://{ip}:{port}'
             torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=args.num_gpus)
+            # torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=host_nums * node_gpus)
 
     # Init torch_utils.
     sync_device = torch.device('cuda', rank) if args.num_gpus > 1 else None
@@ -530,7 +565,10 @@ def main(ctx, outdir, dry_run, **config_kwargs):
         if args.num_gpus == 1:
             subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
+            # torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
+            assert(args.num_gpus == int(os.environ['WORLD_SIZE']) * torch.cuda.device_count())
+            hfai.multiprocessing.spawn(subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus, bind_numa=True)
+            # REMEMBER SET args.num_gpus to total_gpu_nums
 
 #----------------------------------------------------------------------------
 
